@@ -1,0 +1,785 @@
+#!/bin/bash
+
+# Cast the screen, a region, a workspace or a single app to a Chromecast or
+# AirPlay receiver.
+#
+# The desktop is encoded to H.264/AAC and served from a small local HTTP
+# server the receiver pulls from: as one endless fragmented MP4 for Chromecast
+# (low latency, ~1s) or as live HLS with 0.5s segments (AirPlay, or Chromecast
+# with low latency turned off). Workspaces and apps are moved onto a
+# headless Hyprland output sized for the TV, so they cast on their own while
+# the rest of the desktop stays private; they move back when casting stops.
+#
+#   aircast devices [--cached]          List receivers (JSON)
+#   aircast sources                     List monitors, workspaces and windows (JSON)
+#   aircast start <device-id> <source>  Start casting; see sources below
+#   aircast stop                        Stop casting and restore the desktop
+#   aircast status                      Current session (JSON)
+#   aircast firewall                    Let LAN receivers reach the stream (sudo)
+#   aircast install                     Install missing optional tools (sudo)
+#   aircast doctor                      Missing tools and firewall state (JSON)
+#
+# Sources:
+#   screen[:MONITOR]       a whole monitor (default: the focused one)
+#   region[:WxH+X+Y]       a rectangle (default: pick one with slurp)
+#   workspace:ID           a workspace, moved to a virtual display
+#   window:ADDRESS         a window, moved to a virtual display
+#   audio                  system sound only (also works with speakers)
+#
+# Options for start (or the matching AIRCAST_* environment variables):
+#   --resolution WxH       stream size limit / virtual display size (1920x1080)
+#   --fps N                frame rate (30)
+#   --no-audio             do not send desktop audio
+#   --no-low-latency       Chromecast: use HLS instead of a live MP4 stream
+#   --port N               HTTP port the receiver pulls from (8765)
+
+set -uo pipefail
+
+ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
+LIB="$ROOT/lib"
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/omarchy-aircast"
+STATE="$RUNTIME/state.json"
+PIDFILE="$RUNTIME/session.pid"
+LOG="$RUNTIME/session.log"
+LAST_ERROR="$RUNTIME/last-error"
+DEVICES_CACHE="$RUNTIME/devices.json"
+HLS="$RUNTIME/hls"
+LAST_DEVICE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-aircast/last-device"
+OUTPUT="AIRCAST-1"
+
+RESOLUTION="${AIRCAST_RESOLUTION:-1920x1080}"
+FPS="${AIRCAST_FPS:-30}"
+AUDIO="${AIRCAST_AUDIO:-yes}"
+LOW_LATENCY="${AIRCAST_LOW_LATENCY:-yes}"
+PORT="${AIRCAST_PORT:-8765}"
+
+mkdir -p "$RUNTIME"
+
+die() {
+  # Inside the detached session nobody reads stderr, so leave the reason for `start`/`status`.
+  [[ -n ${IN_SESSION:-} ]] && echo "$*" >"$LAST_ERROR"
+  echo "aircast: $*" >&2
+  exit 1
+}
+
+need() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null || die "$cmd is not installed (omarchy pkg add $(package_for "$cmd"))"
+  done
+}
+
+package_for() {
+  case "$1" in
+  avahi-browse) echo avahi ;;
+  gpu-screen-recorder) echo gpu-screen-recorder ;;
+  hyprctl) echo hyprland ;;
+  pactl) echo libpulse ;;
+  *) echo "$1" ;;
+  esac
+}
+
+session_pid() {
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+hypr_dispatch() {
+  hyprctl dispatch "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- discovery
+
+cmd_devices() {
+  if [[ ${1:-} == "--cached" && -s $DEVICES_CACHE ]]; then
+    cat "$DEVICES_CACHE"
+    return
+  fi
+  need avahi-browse python3
+  python3 -I "$LIB/discover.py" >"$DEVICES_CACHE.tmp" && mv "$DEVICES_CACHE.tmp" "$DEVICES_CACHE"
+  cat "$DEVICES_CACHE"
+}
+
+cmd_sources() {
+  need hyprctl jq
+  jq -n \
+    --argjson monitors "$(hyprctl monitors -j)" \
+    --argjson workspaces "$(hyprctl workspaces -j)" \
+    --argjson clients "$(hyprctl clients -j)" \
+    --arg output "$OUTPUT" '
+    {
+      monitors: [$monitors[] | select(.name != $output) | {name, description, width, height, focused}],
+      workspaces: [$workspaces[] | select(.id > 0 and .monitor != $output) | {id, name, monitor, windows}] | sort_by(.id),
+      windows: [$clients[] | select(.mapped and .workspace.id > 0 and .monitor >= 0) | {address, class, title, workspace: .workspace.name}]
+        | sort_by(.workspace, .class)
+    }'
+}
+
+find_device() {
+  local id=$1 device
+  device=$(jq -c --arg id "$id" '.[] | select(.id == $id)' "$DEVICES_CACHE" 2>/dev/null | head -1)
+  if [[ -z $device ]]; then
+    cmd_devices >/dev/null
+    device=$(jq -c --arg id "$id" '.[] | select(.id == $id)' "$DEVICES_CACHE" | head -1)
+  fi
+  [[ -n $device ]] || die "no receiver named $id on the network (try: aircast devices)"
+  echo "$device"
+}
+
+# The receiver pulls the stream from us, so advertise the address it can route to.
+local_address() {
+  local address=$1 family=$2 src
+  if [[ $family == ipv6 ]]; then
+    src=$(ip -o -6 route get "$address" 2>/dev/null | grep -oP 'src \K\S+')
+    [[ -n $src ]] && echo "[$src]"
+  else
+    ip -o -4 route get "$address" 2>/dev/null | grep -oP 'src \K\S+'
+  fi
+}
+
+# ---------------------------------------------------------------- status
+
+write_state() {
+  jq -n \
+    --arg phase "$1" \
+    --argjson device "$DEVICE" \
+    --arg source "$SOURCE" \
+    --arg label "$SOURCE_LABEL" \
+    --arg url "${URL:-}" \
+    --argjson pid $$ \
+    --argjson started "${STARTED:-0}" \
+    '{active: true, phase: $phase, device: $device, source: $source, sourceLabel: $label, url: $url, pid: $pid, startedAt: $started}' \
+    >"$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+cmd_status() {
+  if session_pid >/dev/null && [[ -s $STATE ]]; then
+    cat "$STATE"
+  else
+    jq -n --arg error "$(cat "$LAST_ERROR" 2>/dev/null)" --arg last "$(cat "$LAST_DEVICE" 2>/dev/null)" \
+      '{active: false, error: $error, lastDevice: $last}'
+  fi
+}
+
+# ---------------------------------------------------------------- start/stop
+
+cmd_start() {
+  local device_id="" source=""
+  while (($#)); do
+    case "$1" in
+    --resolution) RESOLUTION=$2; shift ;;
+    --fps) FPS=$2; shift ;;
+    --no-audio) AUDIO=no ;;
+    --no-low-latency) LOW_LATENCY=no ;;
+    --port) PORT=$2; shift ;;
+    -*) die "unknown option $1" ;;
+    *) if [[ -z $device_id ]]; then device_id=$1; else source=$1; fi ;;
+    esac
+    shift
+  done
+  [[ -n $device_id ]] || die "usage: aircast start <device-id> <source>"
+  source=${source:-screen}
+  [[ $RESOLUTION =~ ^[0-9]+x[0-9]+$ ]] || die "resolution must look like 1920x1080"
+
+  need hyprctl jq python3 ip
+
+  if session_pid >/dev/null; then
+    cmd_stop
+  fi
+
+  # A region has to be picked while the user is still at the keyboard,
+  # before the session detaches.
+  if [[ $source == region ]]; then
+    need slurp
+    local geometry
+    geometry=$(slurp -f "%wx%h+%x+%y") || die "region selection cancelled"
+    source="region:$geometry"
+  fi
+
+  find_device "$device_id" >/dev/null
+  mkdir -p "$(dirname "$LAST_DEVICE")" && echo "$device_id" >"$LAST_DEVICE"
+  rm -f "$LAST_ERROR"
+  : >"$LOG"
+  AIRCAST_RESOLUTION=$RESOLUTION AIRCAST_FPS=$FPS AIRCAST_AUDIO=$AUDIO AIRCAST_PORT=$PORT AIRCAST_LOW_LATENCY=$LOW_LATENCY \
+    setsid -f "$0" _session "$device_id" "$source" >>"$LOG" 2>&1 </dev/null
+
+  # Wait for the session to reach the receiver or fail, so callers get a real answer.
+  local i phase
+  for ((i = 0; i < 300; i++)); do
+    sleep 0.1
+    phase=$(jq -r '.phase // empty' "$STATE" 2>/dev/null)
+    if [[ -s $LAST_ERROR ]]; then
+      # Let the session put the desktop back before reporting.
+      for ((i = 0; i < 100; i++)); do
+        session_pid >/dev/null || break
+        sleep 0.1
+      done
+      cat "$LAST_ERROR" >&2
+      return 1
+    fi
+    if [[ $phase == casting ]]; then
+      echo "casting $(jq -r '.sourceLabel + " to " + .device.name' "$STATE")"
+      return 0
+    fi
+  done
+  echo "aircast: still connecting; see $LOG" >&2
+}
+
+cmd_stop() {
+  local pid i
+  pid=$(session_pid) || {
+    rm -f "$STATE" "$PIDFILE"
+    return 0
+  }
+  kill -TERM "$pid" 2>/dev/null
+  for ((i = 0; i < 50; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null
+  restore_desktop_from_state
+}
+
+# ---------------------------------------------------------------- session
+
+# Everything below runs detached, as the session process.
+
+CHILDREN=()
+RESTORE_WORKSPACE=""
+RESTORE_MONITOR=""
+RESTORE_WINDOW=""
+RESTORE_WINDOW_WORKSPACE=""
+RESTORE_WINDOW_FLOATING=""
+RESTORE_WINDOW_FULLSCREEN=""
+RESTORE_SINK=""
+RESTORE_MODULE=""
+OUTPUT_CREATED=""
+
+create_virtual_output() {
+  local width=${RESOLUTION%x*} height=${RESOLUTION#*x} position i
+  hyprctl output remove "$OUTPUT" >/dev/null 2>&1
+  position=$(detached_position "$width")
+  hyprctl eval "hl.monitor({ output = \"$OUTPUT\", mode = \"${width}x${height}@${FPS}\", position = \"$position\", scale = 1 })" >/dev/null 2>&1
+  hyprctl output create headless "$OUTPUT" >/dev/null || die "could not create a virtual display"
+  OUTPUT_CREATED=1
+  for ((i = 0; i < 20; i++)); do
+    hyprctl monitors -j | jq -e --arg o "$OUTPUT" 'any(.[]; .name == $o)' >/dev/null && break
+    sleep 0.1
+  done
+  # The rule is applied on creation, but enforce it in case another rule won.
+  hyprctl eval "hl.monitor({ output = \"$OUTPUT\", mode = \"${width}x${height}@${FPS}\", position = \"$position\", scale = 1 })" >/dev/null 2>&1
+  wait_for_bar
+}
+
+# Left of every real monitor with a gap: Hyprland only lets the pointer cross
+# between touching monitors, so it cannot wander onto the TV. Left, not right,
+# because monitors with position "auto" are laid out to the right of fixed ones
+# and would shift to sit beside it.
+detached_position() {
+  hyprctl monitors -j | jq -r --arg o "$OUTPUT" --argjson w "$1" '
+    [.[] | select(.name != $o) | .x] | (min // 0) - $w - 1000 | "\(.)x0"'
+}
+
+# The shell maps its bar on every new output a moment after it appears. A bar
+# that maps after a window went fullscreen is drawn over it, so let it land first.
+wait_for_bar() {
+  local i
+  hyprctl layers -j | jq -e 'any(.[].levels[][]; .namespace == "omarchy-bar")' >/dev/null || return 0
+  for ((i = 0; i < 30; i++)); do
+    hyprctl layers -j | jq -e --arg o "$OUTPUT" 'any(.[$o].levels[]?[]; .namespace == "omarchy-bar")' >/dev/null && return 0
+    sleep 0.1
+  done
+}
+
+output_workspace() {
+  hyprctl monitors -j | jq -r --arg o "$OUTPUT" '.[] | select(.name == $o) | .activeWorkspace.id'
+}
+
+# ---------------------------------------------------------------- audio routing
+
+# Make $1 the default output and move every playing app onto it.
+route_audio_to() {
+  local sink=$1 input
+  pactl set-default-sink "$sink" || return 1
+  for input in $(pactl list short sink-inputs | cut -f1); do
+    pactl move-sink-input "$input" "$sink" 2>/dev/null
+  done
+}
+
+# PipeWire's RAOP sink listens for the speaker's control and timing packets here.
+RAOP_PORTS=6001:6002
+
+raop_available() {
+  [[ -e /usr/lib/pipewire-0.3/libpipewire-module-raop-sink.so ]]
+}
+
+# PipeWire names AirPlay sinks after the speaker, with its address in the name
+# or properties; match on either the address or the mDNS host name.
+find_raop_sink() {
+  pactl -f json list sinks 2>/dev/null | jq -r --arg a "$1" --arg h "${2%.local}" '
+    .[] | select(.name | startswith("raop")) |
+    select([.name, (.properties // {} | .[] | tostring)] | any(contains($a) or contains($h))) | .name' | head -1
+}
+
+prepare_audio() {
+  local protocol address host sink i
+  protocol=$(jq -r .protocol <<<"$DEVICE")
+  address=$(jq -r .address <<<"$DEVICE")
+  host=$(jq -r .host <<<"$DEVICE")
+  command -v pactl >/dev/null || die "audio casting needs pactl (omarchy pkg add libpulse)"
+  RESTORE_SINK=$(pactl get-default-sink)
+
+  if [[ $protocol == airplay ]]; then
+    # PipeWire speaks AirPlay audio itself; the speaker becomes the output.
+    raop_available || die "AirPlay speakers need pipewire-zeroconf (aircast install)"
+    sink=$(find_raop_sink "$address" "$host")
+    if [[ -z $sink ]]; then
+      RESTORE_MODULE=$(pactl load-module module-raop-discover) || die "PipeWire could not start AirPlay discovery"
+      save_restore_info
+      for ((i = 0; i < 100; i++)); do
+        sink=$(find_raop_sink "$address" "$host")
+        [[ -n $sink ]] && break
+        sleep 0.1
+      done
+    fi
+    [[ -n $sink ]] || die "PipeWire found no AirPlay output for $(jq -r .name <<<"$DEVICE")"
+    route_audio_to "$sink" || die "could not switch audio to $(jq -r .name <<<"$DEVICE")"
+    CAPTURE=(sink "$sink")
+  else
+    # Apps play into a silent sink whose monitor is streamed, so the laptop
+    # speakers stay quiet instead of playing ahead of the receiver.
+    RESTORE_MODULE=$(pactl load-module module-null-sink sink_name=aircast sink_properties=device.description=Aircast) ||
+      die "could not create the Aircast audio output"
+    save_restore_info
+    route_audio_to aircast || die "could not switch audio to Aircast"
+    CAPTURE=(pulse aircast.monitor)
+  fi
+  SOURCE_LABEL="Audio"
+}
+
+prepare_source() {
+  if [[ $SOURCE != audio && $(jq -r .video <<<"$DEVICE") == false ]]; then
+    die "$(jq -r .name <<<"$DEVICE") is a speaker; it can only play audio"
+  fi
+  case "$SOURCE" in
+  audio)
+    prepare_audio
+    ;;
+  screen | screen:*)
+    local monitor=${SOURCE#screen}
+    monitor=${monitor#:}
+    if [[ -z $monitor ]]; then
+      monitor=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
+    fi
+    hyprctl monitors -j | jq -e --arg m "$monitor" 'any(.[]; .name == $m)' >/dev/null || die "no monitor named $monitor"
+    CAPTURE=(gsr -w "$monitor")
+    SOURCE_LABEL="Screen $monitor"
+    ;;
+  region:*)
+    local geometry=${SOURCE#region:}
+    [[ $geometry =~ ^[0-9]+x[0-9]+\+-?[0-9]+\+-?[0-9]+$ ]] || die "region must look like WxH+X+Y"
+    CAPTURE=(gsr -w region -region "$geometry")
+    SOURCE_LABEL="Region ${geometry%%+*}"
+    ;;
+  workspace:*)
+    local workspace=${SOURCE#workspace:}
+    RESTORE_MONITOR=$(hyprctl workspaces -j | jq -r --arg w "$workspace" '.[] | select((.id | tostring) == $w or .name == $w) | .monitor')
+    [[ -n $RESTORE_MONITOR ]] || die "workspace $workspace does not exist"
+    create_virtual_output
+    RESTORE_WORKSPACE=$workspace
+    local focused
+    focused=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
+    hypr_dispatch "hl.dsp.workspace.move({ workspace = \"$workspace\", monitor = \"$OUTPUT\" })" ||
+      die "could not move workspace $workspace to the virtual display"
+    # A moved workspace is not shown until focused; show it, then hand focus back.
+    hypr_dispatch "hl.dsp.focus({ workspace = \"$workspace\" })"
+    hypr_dispatch "hl.dsp.focus({ monitor = \"$focused\" })"
+    CAPTURE=(wf -o "$OUTPUT")
+    SOURCE_LABEL="Workspace $workspace"
+    ;;
+  window:*)
+    local address=${SOURCE#window:} client
+    client=$(hyprctl clients -j | jq -c --arg a "$address" '.[] | select(.address == $a)')
+    [[ -n $client ]] || die "window $address is gone"
+    create_virtual_output
+    RESTORE_WINDOW=$address
+    RESTORE_WINDOW_WORKSPACE=$(jq -r '.workspace.name' <<<"$client")
+    RESTORE_WINDOW_FLOATING=$(jq -r '.floating' <<<"$client")
+    RESTORE_WINDOW_FULLSCREEN=$(jq -r '.fullscreen' <<<"$client")
+    hypr_dispatch "hl.dsp.window.move({ window = \"address:$address\", workspace = \"$(output_workspace)\", follow = false })" ||
+      die "could not move the window to the virtual display"
+    if [[ $RESTORE_WINDOW_FLOATING == true ]]; then
+      hypr_dispatch "hl.dsp.window.float({ action = \"disable\", window = \"address:$address\" })"
+    fi
+    hypr_dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"set\", window = \"address:$address\" })"
+    CAPTURE=(wf -o "$OUTPUT")
+    SOURCE_LABEL=$(jq -r '.class // .title' <<<"$client")
+    ;;
+  *)
+    die "unknown source $SOURCE (screen, region, workspace:ID, window:ADDRESS or audio)"
+    ;;
+  esac
+}
+
+# Persist what has to be undone, so `aircast stop` can still repair the desktop
+# if this process is killed without running its trap.
+save_restore_info() {
+  jq -n \
+    --arg ws "$RESTORE_WORKSPACE" --arg mon "$RESTORE_MONITOR" \
+    --arg win "$RESTORE_WINDOW" --arg winws "$RESTORE_WINDOW_WORKSPACE" --arg float "$RESTORE_WINDOW_FLOATING" \
+    --arg fullscreen "$RESTORE_WINDOW_FULLSCREEN" \
+    --arg output "$OUTPUT_CREATED" --arg sink "$RESTORE_SINK" --arg module "$RESTORE_MODULE" \
+    '{workspace: $ws, monitor: $mon, window: $win, windowWorkspace: $winws, windowFloating: $float, windowFullscreen: $fullscreen,
+      output: $output, sink: $sink, module: $module}' \
+    >"$RUNTIME/restore.json"
+}
+
+restore_desktop() {
+  if [[ -n $RESTORE_WINDOW ]] && hyprctl clients -j | jq -e --arg a "$RESTORE_WINDOW" 'any(.[]; .address == $a)' >/dev/null; then
+    if [[ $RESTORE_WINDOW_FULLSCREEN == 0 ]]; then
+      hypr_dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"unset\", window = \"address:$RESTORE_WINDOW\" })"
+    fi
+    hypr_dispatch "hl.dsp.window.move({ window = \"address:$RESTORE_WINDOW\", workspace = \"$RESTORE_WINDOW_WORKSPACE\", follow = false })"
+    if [[ $RESTORE_WINDOW_FLOATING == true ]]; then
+      hypr_dispatch "hl.dsp.window.float({ action = \"enable\", window = \"address:$RESTORE_WINDOW\" })"
+    fi
+  fi
+  if [[ -n $RESTORE_WORKSPACE && -n $RESTORE_MONITOR ]]; then
+    hypr_dispatch "hl.dsp.workspace.move({ workspace = \"$RESTORE_WORKSPACE\", monitor = \"$RESTORE_MONITOR\" })"
+  fi
+  if [[ -n $OUTPUT_CREATED ]]; then
+    hyprctl output remove "$OUTPUT" >/dev/null 2>&1
+  fi
+  if [[ -n $RESTORE_SINK ]]; then
+    route_audio_to "$RESTORE_SINK" 2>/dev/null
+  fi
+  if [[ -n $RESTORE_MODULE ]]; then
+    pactl unload-module "$RESTORE_MODULE" 2>/dev/null
+  fi
+  rm -f "$RUNTIME/restore.json"
+}
+
+restore_desktop_from_state() {
+  [[ -s $RUNTIME/restore.json ]] || return 0
+  RESTORE_WORKSPACE=$(jq -r .workspace "$RUNTIME/restore.json")
+  RESTORE_MONITOR=$(jq -r .monitor "$RUNTIME/restore.json")
+  RESTORE_WINDOW=$(jq -r .window "$RUNTIME/restore.json")
+  RESTORE_WINDOW_WORKSPACE=$(jq -r .windowWorkspace "$RUNTIME/restore.json")
+  RESTORE_WINDOW_FLOATING=$(jq -r .windowFloating "$RUNTIME/restore.json")
+  RESTORE_WINDOW_FULLSCREEN=$(jq -r .windowFullscreen "$RUNTIME/restore.json")
+  OUTPUT_CREATED=$(jq -r .output "$RUNTIME/restore.json")
+  RESTORE_SINK=$(jq -r '.sink // empty' "$RUNTIME/restore.json")
+  RESTORE_MODULE=$(jq -r '.module // empty' "$RUNTIME/restore.json")
+  restore_desktop
+  rm -f "$STATE" "$PIDFILE"
+}
+
+# Encoder output: fragmented MP4 on stdout (live) or HLS files (hls).
+# Fragments are cut at every keyframe and at least every 0.1s, so the receiver
+# never waits long for the next piece; live_server.py joins clients on keyframes.
+MP4_FLAGS="frag_keyframe+empty_moov+default_base_moof"
+FRAG_DURATION=100000
+HLS_FLAGS="delete_segments+omit_endlist+independent_segments"
+
+start_capture() {
+  local kind=${CAPTURE[0]}
+  local args=("${CAPTURE[@]:1}")
+  local server=(python3 -I "$LIB/live_server.py" "$PORT" "$RUNTIME/live.ready")
+
+  if [[ $kind == sink ]]; then
+    # PipeWire streams to the AirPlay speaker itself; just watch it stays around.
+    (while pactl list short sinks | grep -qF "${args[0]}"; do sleep 2; done) &
+    CHILDREN+=($!)
+  elif [[ $kind == pulse ]]; then
+    need ffmpeg
+    local output=(-f hls -hls_time 0.5 -hls_list_size 8 -hls_flags "$HLS_FLAGS" "$HLS/stream.m3u8")
+    [[ $STREAM == live ]] && output=(-f mp4 -movflags "$MP4_FLAGS" -frag_duration "$FRAG_DURATION" -flush_packets 1 pipe:1)
+    (
+      ffmpeg -hide_banner -loglevel error -fflags nobuffer -f pulse -fragment_size 1920 -i "${args[0]}" \
+        -c:a aac -b:a 256k "${output[@]}" |
+        if [[ $STREAM == live ]]; then "${server[@]}"; else cat >/dev/null; fi
+    ) 2>>"$LOG" &
+    CHILDREN+=($!)
+  elif [[ $kind == gsr ]]; then
+    need gpu-screen-recorder
+    local audio=()
+    [[ $AUDIO == yes ]] && audio=(-a default_output -ac aac)
+    # A keyframe every 0.5s bounds the HLS segment length and how long a
+    # receiver waits to join the live stream.
+    local gsr=(gpu-screen-recorder "${args[@]}" -s "$RESOLUTION" -f "$FPS" -fm cfr -k h264 -keyint 0.5 "${audio[@]}")
+    if hardware_encoder; then
+      gsr+=(-encoder gpu)
+    else
+      # x264's default frame threading buffers ~1 frame per thread before any
+      # output; zerolatency switches to slice threads and drops that delay.
+      gsr+=(-encoder cpu -ffmpeg-video-opts "tune=zerolatency")
+    fi
+    if [[ $STREAM == live ]]; then
+      ("${gsr[@]}" -c mp4 -ffmpeg-opts "movflags=$MP4_FLAGS;frag_duration=$FRAG_DURATION" | "${server[@]}") &
+    else
+      "${gsr[@]}" -c hls -ffmpeg-opts "hls_time=0.5;hls_list_size=8;hls_flags=$HLS_FLAGS" -o "$HLS/stream.m3u8" &
+    fi
+    CHILDREN+=($!)
+  else
+    # gpu-screen-recorder captures through KMS, which cannot see Hyprland's
+    # headless outputs, so virtual displays go through wlr-screencopy.
+    command -v wf-recorder >/dev/null || die "casting a workspace or app needs wf-recorder (aircast install)"
+    need ffmpeg
+    local audio=() ffmpeg_audio=(-an)
+    if [[ $AUDIO == yes ]] && command -v pactl >/dev/null; then
+      audio=(--audio="$(pactl get-default-sink).monitor" -C aac)
+      ffmpeg_audio=(-c:a copy)
+    fi
+    local output=(-f hls -hls_time 0.5 -hls_list_size 8 -hls_flags "$HLS_FLAGS" "$HLS/stream.m3u8")
+    # MPEG-TS carries AAC as ADTS; MP4 needs it converted.
+    [[ $STREAM == live ]] && output=(-bsf:a aac_adtstoasc -f mp4 -movflags "$MP4_FLAGS"
+      -frag_duration "$FRAG_DURATION" -flush_packets 1 pipe:1)
+    (
+      wf-recorder "${args[@]}" -r "$FPS" -c libx264 -x yuv420p \
+        -p preset=veryfast -p tune=zerolatency -p g="$(((FPS + 1) / 2))" "${audio[@]}" \
+        -m mpegts -f pipe:1 -y 2>>"$LOG" |
+        ffmpeg -hide_banner -loglevel error -fflags nobuffer -i pipe:0 -c:v copy "${ffmpeg_audio[@]}" "${output[@]}" |
+        if [[ $STREAM == live ]]; then "${server[@]}"; else cat >/dev/null; fi
+    ) &
+    CHILDREN+=($!)
+  fi
+  CAPTURE_PID=$!
+}
+
+hardware_encoder() {
+  gpu-screen-recorder --info 2>/dev/null | grep -qx h264
+}
+
+start_sender() {
+  local protocol address port name
+  protocol=$(jq -r .protocol <<<"$DEVICE")
+  address=$(jq -r .address <<<"$DEVICE")
+  port=$(jq -r .port <<<"$DEVICE")
+
+  SENDER_REPORTS_PLAYING=yes
+  case "$protocol" in
+  chromecast)
+    local type=application/x-mpegURL
+    [[ $STREAM == live ]] && type=video/mp4
+    [[ $STREAM == live && $SOURCE == audio ]] && type=audio/mp4
+    python3 -I "$LIB/chromecast.py" play "$address" "$URL" --title "$SOURCE_LABEL" --content-type "$type" &
+    ;;
+  airplay)
+    if command -v atvremote >/dev/null; then
+      SENDER_REPORTS_PLAYING=no
+      atvremote -s "$address" play_url="$URL" &
+    else
+      python3 -I "$LIB/airplay.py" play "$address" "$port" "$URL" &
+    fi
+    ;;
+  esac
+  CHILDREN+=($!)
+  SENDER_PID=$!
+}
+
+# The sender prints "playing" once the receiver accepted the stream.
+wait_for_receiver() {
+  local i
+  for ((i = 0; i < 300; i++)); do
+    if [[ $SENDER_REPORTS_PLAYING == yes ]]; then
+      grep -q '^playing$' "$LOG" && return 0
+    elif ((i >= 30)); then
+      return 0 # atvremote is silent while it plays; alive after 3s means accepted
+    fi
+    if ! kill -0 "$CAPTURE_PID" 2>/dev/null || { [[ -n ${SERVER_PID:-} ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; }; then
+      die "capture stopped: $(grep -iE 'error' "$LOG" | grep -v vaapi | tail -1)"
+    fi
+    if ! kill -0 "$SENDER_PID" 2>/dev/null; then
+      local reason hint=""
+      reason=$(grep -E '^(chromecast|airplay|aircast):' "$LOG" | tail -1)
+      [[ $STREAM == live && $reason == *"refused the stream"* ]] && hint=" (turn off low latency in the widget settings)"
+      die "$(jq -r .name <<<"$DEVICE") did not accept the stream: $reason$hint"
+    fi
+    sleep 0.1
+  done
+}
+
+wait_for_stream() {
+  local i
+  for ((i = 0; i < 150; i++)); do
+    if [[ $STREAM == live ]]; then
+      [[ -e $RUNTIME/live.ready ]] && return 0
+    # Receivers want a few segments up front or they stall immediately.
+    elif [[ $(grep -c '\.ts$' "$HLS/stream.m3u8" 2>/dev/null) -ge 3 ]]; then
+      return 0
+    fi
+    jobs_alive || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
+jobs_alive() {
+  local pid
+  for pid in "${CHILDREN[@]}"; do
+    kill -0 "$pid" 2>/dev/null || return 1
+  done
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  local pid
+  for pid in "${CHILDREN[@]}"; do
+    pkill -TERM -P "$pid" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+  done
+  wait 2>/dev/null
+  restore_desktop
+  rm -rf "$HLS" "$STATE" "$PIDFILE" "$RUNTIME/live.ready"
+  exit "$status"
+}
+
+cmd_session() {
+  local device_id=$1
+  SOURCE=$2
+  SOURCE_LABEL=$SOURCE
+  IN_SESSION=1
+  DEVICE=$(find_device "$device_id") || die "receiver $device_id not found"
+  STARTED=$(date +%s)
+
+  echo $$ >"$PIDFILE"
+  trap cleanup EXIT
+  trap 'exit 0' INT TERM
+
+  write_state starting
+  rm -rf "$HLS" "$RUNTIME/live.ready" && mkdir -p "$HLS"
+
+  STREAM=hls
+  [[ $(jq -r .protocol <<<"$DEVICE") == chromecast && $LOW_LATENCY == yes ]] && STREAM=live
+  # AirPlay audio goes through PipeWire: no stream server, no sender.
+  [[ $(jq -r .protocol <<<"$DEVICE") == airplay && $SOURCE == audio ]] && STREAM=none
+
+  if [[ $STREAM != none ]]; then
+    local host
+    host=$(local_address "$(jq -r .address <<<"$DEVICE")" "$(jq -r .family <<<"$DEVICE")")
+    [[ -n $host ]] || die "no network route to $(jq -r .name <<<"$DEVICE")"
+    URL="http://$host:$PORT/stream.m3u8"
+    [[ $STREAM == live ]] && URL="http://$host:$PORT/live.mp4"
+    if ss -Hltn "sport = :$PORT" | grep -q .; then
+      die "port $PORT is already in use (set AIRCAST_PORT)"
+    fi
+  fi
+  # The live stream is served by the capture pipeline itself.
+  if [[ $STREAM == hls ]]; then
+    python3 -I "$LIB/hls_server.py" "$HLS" "$PORT" &
+    CHILDREN+=($!)
+    SERVER_PID=$!
+  fi
+
+  prepare_source
+  save_restore_info
+  write_state starting
+  start_capture
+  if [[ $STREAM != none ]]; then
+    wait_for_stream || die "capture did not start: $(grep -iE 'error' "$LOG" | grep -v vaapi | tail -1)"
+    start_sender
+    write_state connecting
+    wait_for_receiver
+  fi
+  write_state casting
+  notify-send -a Aircast "Casting to $(jq -r .name <<<"$DEVICE")" "$SOURCE_LABEL" 2>/dev/null
+
+  # Any piece stopping (receiver closed, capture died) ends the session.
+  wait -n
+  echo "aircast: session ended" >&2
+}
+
+# ---------------------------------------------------------------- firewall
+
+cmd_firewall() {
+  command -v ufw >/dev/null || {
+    echo "ufw is not installed; nothing to do."
+    return 0
+  }
+  # Private IPv4 ranges, IPv6 ULAs, and the global IPv6 prefixes of the
+  # networks this machine is on right now (many TVs only announce IPv6).
+  local network
+  for network in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7 \
+    $(ip -o -6 route show proto ra 2>/dev/null | awk '$1 ~ /\/64$/ {print $1}') \
+    $(ip -o -6 route show proto kernel 2>/dev/null | awk '$1 ~ /^[23].*\/64$/ {print $1}'); do
+    sudo ufw allow in proto tcp from "$network" to any port "$PORT" comment 'omarchy-aircast'
+    # AirPlay speakers send timing and resend requests back to PipeWire.
+    sudo ufw allow in proto udp from "$network" to any port "$RAOP_PORTS" comment 'omarchy-aircast airplay audio'
+  done
+}
+
+cmd_install() {
+  local packages=()
+  command -v wf-recorder >/dev/null || packages+=(wf-recorder)
+  command -v ffmpeg >/dev/null || packages+=(ffmpeg)
+  if intel_driver_missing; then
+    echo "Installing intel-media-driver (hardware video encoding: less delay, less CPU)"
+    packages+=(intel-media-driver)
+  fi
+  if ! raop_available && jq -e 'any(.[]; .protocol == "airplay")' "$DEVICES_CACHE" >/dev/null 2>&1; then
+    echo "Installing pipewire-zeroconf (audio to AirPlay speakers)"
+    packages+=(pipewire-zeroconf)
+  fi
+  if ((${#packages[@]})); then
+    echo "Installing ${packages[*]}"
+    omarchy pkg add "${packages[@]}" || return 1
+  fi
+  # pyatv is only worth it when an AirPlay TV is around.
+  if ! command -v atvremote >/dev/null && jq -e 'any(.[]; .protocol == "airplay" and .video)' "$DEVICES_CACHE" >/dev/null 2>&1; then
+    echo "Installing pyatv (AirPlay to modern Apple TVs)"
+    omarchy pkg aur add python-pyatv || return 1
+  fi
+  echo "Aircast has everything it needs."
+}
+
+# Intel GPUs encode in hardware only with the iHD VA-API driver.
+intel_driver_missing() {
+  [[ $(gpu-screen-recorder --info 2>/dev/null | grep -oP '^vendor\|\K.*') == intel ]] &&
+    ! hardware_encoder && ! pacman -Q intel-media-driver &>/dev/null
+}
+
+firewall_open() {
+  # Readable without root on Omarchy; if it is not, assume the user handled it.
+  [[ -r /etc/ufw/user.rules ]] || return 0
+  systemctl is-active --quiet ufw || return 0
+  grep -q -- "--dport $PORT " /etc/ufw/user.rules || return 1
+  # ufw writes port ranges as a multiport match: --dports 6001:6002.
+  ! raop_available || grep -q -- "--dports $RAOP_PORTS " /etc/ufw/user.rules
+}
+
+cmd_doctor() {
+  local missing=()
+  local cmd
+  for cmd in gpu-screen-recorder avahi-browse python3 jq hyprctl slurp; do
+    command -v "$cmd" >/dev/null || missing+=("$cmd")
+  done
+  local optional=()
+  for cmd in wf-recorder atvremote; do
+    command -v "$cmd" >/dev/null || optional+=("$cmd")
+  done
+  jq -n \
+    --argjson missing "$(printf '%s\n' "${missing[@]}" | jq -R . | jq -sc 'map(select(. != ""))')" \
+    --argjson optional "$(printf '%s\n' "${optional[@]}" | jq -R . | jq -sc 'map(select(. != ""))')" \
+    --argjson firewall "$(firewall_open && echo true || echo false)" \
+    --argjson port "$PORT" \
+    --argjson hw "$(hardware_encoder && echo true || echo false)" \
+    --argjson intel "$(intel_driver_missing && echo true || echo false)" \
+    --argjson raop "$(raop_available && echo true || echo false)" \
+    '{missing: $missing, missingOptional: $optional, firewallOpen: $firewall, port: $port,
+      hardwareEncoder: $hw, intelDriverMissing: $intel, airplayAudio: $raop}'
+}
+
+case "${1:-}" in
+devices) shift; cmd_devices "$@" ;;
+sources) cmd_sources ;;
+start) shift; cmd_start "$@" ;;
+stop) cmd_stop ;;
+status) cmd_status ;;
+firewall) cmd_firewall ;;
+install) cmd_install ;;
+doctor) cmd_doctor ;;
+_session) shift; cmd_session "$@" ;;
+*) sed -n '3,35p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

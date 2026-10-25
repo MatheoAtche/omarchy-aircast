@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "matheoatche.aircast",
+  "name": "Aircast",
+  "version": "1.0.0",
+  "author": "Mathéo Atché",
+  "license": "MIT",
+  "description": "Cast the screen, a region, a workspace or a single app to a Chromecast or AirPlay receiver.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Aircast",
+    "description": "Cast the screen, a region, a workspace or an app to a Chromecast or AirPlay TV.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "resolution": "1920x1080",
+      "fps": 30,
+      "audio": true,
+      "lowLatency": true,
+      "port": 8765
+    },
+    "schema": [
+      {
+        "key": "resolution",
+        "type": "string",
+        "label": "Stream resolution (also the virtual display size)"
+      },
+      {
+        "key": "fps",
+        "type": "integer",
+        "label": "Frame rate",
+        "min": 10,
+        "max": 60,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "audio",
+        "type": "boolean",
+        "label": "Send desktop audio"
+      },
+      {
+        "key": "lowLatency",
+        "type": "boolean",
+        "label": "Low latency on Chromecast (~1 s; turn off if playback stutters)"
+      },
+      {
+        "key": "port",
+        "type": "integer",
+        "label": "Stream port (open it with: aircast firewall)",
+        "min": 1024,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 8765
+      }
+    ]
+  }
+}
