@@ -186,10 +186,15 @@ aircast doctor                                    # missing tools, firewall
 aircast install                                   # install missing optional tools
 ```
 
-Example Hyprland binding (`~/.config/hypr/bindings.lua`):
+### Keybindings
+
+The popup opens from the keyboard too, so the whole flow works without the
+mouse. Example Hyprland bindings (`~/.config/hypr/bindings.lua`):
 
 ```lua
-o.bind("SUPER + CTRL + C", "Stop casting",
+o.bind("SUPER + ALT + C", "Cast",
+  hl.dsp.exec_cmd("omarchy-shell matheoatche.aircast toggle"))
+o.bind("SUPER + SHIFT + ALT + C", "Stop casting",
   hl.dsp.exec_cmd("~/.config/omarchy/plugins/matheoatche.aircast/bin/aircast stop"))
 ```
 

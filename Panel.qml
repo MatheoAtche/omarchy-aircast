@@ -10,7 +10,7 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "matheoatche.aircast"
-  manageIpc: false
+  ipcTarget: "matheoatche.aircast"
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
