@@ -9,6 +9,11 @@ An Omarchy bar widget that casts to a Chromecast or AirPlay TV. You can cast:
 - **audio only**, to a TV or to a speaker (Google Home/Nest, Sonos, HomePod and
   other AirPlay speakers)
 
+<p>
+  <img src="docs/popup.png" alt="Aircast popup: receivers and what to cast" width="330">
+  <img src="docs/sources.png" alt="Source picker: audio, screen, region, workspaces and apps" width="330">
+</p>
+
 ### What "moves to the TV while casting" means
 
 Hyprland can't render a workspace that isn't on a monitor. So for a workspace
