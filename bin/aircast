@@ -15,7 +15,7 @@
 #   aircast start <device-id> <source>  Start casting; see sources below
 #   aircast stop                        Stop casting and restore the desktop
 #   aircast status                      Current session (JSON)
-#   aircast firewall                    Let LAN receivers reach the stream (sudo)
+#   aircast firewall [--remove]         Let LAN receivers reach the stream, or undo it (sudo)
 #   aircast install                     Install missing optional tools (sudo)
 #   aircast doctor                      Missing tools and firewall state (JSON)
 #
@@ -693,11 +693,26 @@ cmd_session() {
 
 # ---------------------------------------------------------------- firewall
 
+firewall_rule_numbers() {
+  sed -n 's/^\[ *\([0-9]\+\)\].*# omarchy-aircast.*/\1/p' | sort -rn
+}
+
 cmd_firewall() {
   command -v ufw >/dev/null || {
     echo "ufw is not installed; nothing to do."
     return 0
   }
+  if [[ ${1:-} == --remove ]]; then
+    # Every rule carries an omarchy-aircast comment. Delete from the highest
+    # number down so the numbers still to delete stay valid.
+    local numbers number
+    numbers=$(sudo ufw status numbered | firewall_rule_numbers)
+    for number in $numbers; do
+      sudo ufw --force delete "$number" >/dev/null
+    done
+    echo "Removed $(wc -w <<<"$numbers") Aircast firewall rule(s)."
+    return 0
+  fi
   # Private IPv4 ranges, IPv6 ULAs, and the global IPv6 prefixes of the
   # networks this machine is on right now (many TVs only announce IPv6).
   local network
@@ -777,7 +792,7 @@ sources) cmd_sources ;;
 start) shift; cmd_start "$@" ;;
 stop) cmd_stop ;;
 status) cmd_status ;;
-firewall) cmd_firewall ;;
+firewall) shift; cmd_firewall "$@" ;;
 install) cmd_install ;;
 doctor) cmd_doctor ;;
 _session) shift; cmd_session "$@" ;;

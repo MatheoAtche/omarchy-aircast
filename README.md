@@ -111,7 +111,8 @@ The widget shows an **Open firewall** row until this is done.
 
 The stream is plain HTTP with no authentication. While you cast, anyone on
 your local network who knows the port can watch it too. Nothing is served when
-you aren't casting, and the rules above only allow private address ranges.
+you aren't casting. The rules only allow private address ranges and the IPv6
+prefixes of the networks you're on when you run the command.
 
 ### AirPlay pairing
 
@@ -139,6 +140,22 @@ ln -s "$PWD" ~/.config/omarchy/plugins/matheoatche.aircast
 omarchy-shell shell rescanPlugins
 omarchy plugin enable matheoatche.aircast
 ```
+
+## Uninstall
+
+Stop any cast, close the firewall ports Aircast opened, then remove the plugin:
+
+```bash
+~/.config/omarchy/plugins/matheoatche.aircast/bin/aircast stop
+~/.config/omarchy/plugins/matheoatche.aircast/bin/aircast firewall --remove
+omarchy plugin remove matheoatche.aircast
+```
+
+Then delete any Aircast keybindings you added and, if you like, the last-used
+receiver in `~/.local/state/omarchy-aircast/`. Packages installed from the
+**Setup** section (`wf-recorder`, `pyatv`, `pipewire-zeroconf`,
+`intel-media-driver`) stay installed; remove them with `omarchy pkg remove` if
+nothing else needs them.
 
 ## Use
 
@@ -183,6 +200,7 @@ aircast stop
 aircast status
 aircast start chromecast:ea83… screen --no-low-latency
 aircast doctor                                    # missing tools, firewall
+aircast firewall --remove                         # close the ports again
 aircast install                                   # install missing optional tools
 ```
 
