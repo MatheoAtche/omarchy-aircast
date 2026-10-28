@@ -314,7 +314,7 @@ Panel {
     else if (r.kind === "stop") stopCast()
     else if (r.kind === "firewall" || r.kind === "install") {
       // Both need sudo, so they run in a terminal; the panel rechecks on next open.
-      Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "'" + cli + "' " + r.kind])
+      Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "'" + cli.replace(/'/g, "'\\''") + "' " + r.kind])
       root.close()
     }
   }

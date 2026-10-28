@@ -92,7 +92,8 @@ those two modes record with `wf-recorder`.
 section offers the missing pieces instead. Each row opens a terminal for sudo
 and runs `aircast install`, which calls `omarchy pkg add` (or `omarchy pkg aur
 add` for pyatv). Clicking a workspace or app before wf-recorder is installed
-does the same.
+does the same. pyatv comes from the AUR, so it's packaged by the community
+rather than by Arch.
 
 The Chromecast sender, legacy AirPlay sender, stream servers and device
 discovery are bundled, stdlib-only Python scripts in `lib/`.
@@ -109,10 +110,12 @@ it (UDP 6001–6002). Allow these ports from your local network only:
 
 The widget shows an **Open firewall** row until this is done.
 
-The stream is plain HTTP with no authentication. While you cast, anyone on
-your local network who knows the port can watch it too. Nothing is served when
-you aren't casting. The rules only allow private address ranges and the IPv6
-prefixes of the networks you're on when you run the command.
+The stream is plain HTTP, so it isn't encrypted on the network. Its address
+carries a random token made for each cast and given only to the receiver, so
+other devices on your network and web pages in your browser can't guess where
+to watch. Nothing is served when you aren't casting. The rules only allow
+private address ranges and the IPv6 prefixes of the networks you're on when
+you run the command.
 
 ### AirPlay pairing
 

@@ -16,6 +16,7 @@ import time
 import uuid
 
 HEADERS = {"User-Agent": "MediaControl/1.0", "X-Apple-Session-ID": str(uuid.uuid4())}
+MAX_REPLY = 65536  # replies are a few lines; refuse a receiver that sends more
 
 
 def request(conn, method, path, body=None, content_type=None):
@@ -24,7 +25,10 @@ def request(conn, method, path, body=None, content_type=None):
         headers["Content-Type"] = content_type
     conn.request(method, path, body=body, headers=headers)
     response = conn.getresponse()
-    return response.status, response.read().decode(errors="replace")
+    body = response.read(MAX_REPLY + 1)
+    if len(body) > MAX_REPLY:
+        raise RuntimeError("receiver sent an oversized reply")
+    return response.status, body.decode(errors="replace")
 
 
 def main():
@@ -65,7 +69,7 @@ def main():
             elif started:
                 print("receiver stopped playback", flush=True)
                 return
-    except (OSError, http.client.HTTPException, RuntimeError) as error:
+    except (OSError, http.client.HTTPException, RuntimeError, ValueError) as error:
         print("airplay: %s" % error, file=sys.stderr)
         sys.exit(1)
 

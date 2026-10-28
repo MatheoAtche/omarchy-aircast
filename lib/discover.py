@@ -52,7 +52,10 @@ def to_device(protocol, fields):
 
     if protocol == "chromecast":
         # "ca" is a capability bitmask: bit 0 video out, bit 2 audio out.
-        caps = int(txt.get("ca", "5") or 5)
+        try:
+            caps = int(txt.get("ca") or 5)
+        except ValueError:
+            caps = 5  # malformed; list it like a TV rather than not at all
         video, audio = bool(caps & 1), bool(caps & 4)
         ident = txt.get("id") or name
         label = txt.get("fn") or unescape(name)
@@ -96,7 +99,10 @@ def main():
             fields = line.split(";")
             if fields[0] != "=" or len(fields) < 10:
                 continue
-            device = to_device(protocol, fields)
+            try:
+                device = to_device(protocol, fields)
+            except ValueError:
+                continue  # one malformed announcement must not hide the others
             if not device:
                 continue
             known = devices.get(device["id"])

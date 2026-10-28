@@ -37,7 +37,13 @@ set -uo pipefail
 
 ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
 LIB="$ROOT/lib"
-RUNTIME="${XDG_RUNTIME_DIR:-/tmp}/omarchy-aircast"
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  RUNTIME="$XDG_RUNTIME_DIR/omarchy-aircast"
+else
+  # Outside a login session there is no private runtime dir. /tmp is shared,
+  # so use a per-user directory there; one somebody else made is refused below.
+  RUNTIME="/tmp/omarchy-aircast-$UID"
+fi
 STATE="$RUNTIME/state.json"
 PIDFILE="$RUNTIME/session.pid"
 LOG="$RUNTIME/session.log"
@@ -53,7 +59,11 @@ AUDIO="${AIRCAST_AUDIO:-yes}"
 LOW_LATENCY="${AIRCAST_LOW_LATENCY:-yes}"
 PORT="${AIRCAST_PORT:-8765}"
 
-mkdir -p "$RUNTIME"
+mkdir -p -m 700 "$RUNTIME"
+if [[ -L $RUNTIME || ! -O $RUNTIME ]]; then
+  echo "aircast: $RUNTIME belongs to someone else; not using it" >&2
+  exit 1
+fi
 
 die() {
   # Inside the detached session nobody reads stderr, so leave the reason for `start`/`status`.
@@ -82,7 +92,16 @@ package_for() {
 session_pid() {
   local pid
   pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
-  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+  # A session killed without its trap leaves the file behind, and its PID may
+  # since belong to another process; only a session counts.
+  [[ $pid =~ ^[0-9]+$ ]] && grep -qzx _session "/proc/$pid/cmdline" 2>/dev/null && echo "$pid"
+}
+
+# Settings end up in Lua for hyprctl and in shell arithmetic, so only numbers.
+check_settings() {
+  [[ $RESOLUTION =~ ^[0-9]+x[0-9]+$ ]] || die "resolution must look like 1920x1080"
+  [[ $FPS =~ ^[1-9][0-9]{0,2}$ ]] || die "fps must be a whole number like 30"
+  [[ $PORT =~ ^[1-9][0-9]{0,4}$ ]] && ((PORT <= 65535)) || die "port must be a number from 1 to 65535"
 }
 
 hypr_dispatch() {
@@ -180,7 +199,7 @@ cmd_start() {
   done
   [[ -n $device_id ]] || die "usage: aircast start <device-id> <source>"
   source=${source:-screen}
-  [[ $RESOLUTION =~ ^[0-9]+x[0-9]+$ ]] || die "resolution must look like 1920x1080"
+  check_settings
 
   need hyprctl jq python3 ip
 
@@ -204,9 +223,10 @@ cmd_start() {
   AIRCAST_RESOLUTION=$RESOLUTION AIRCAST_FPS=$FPS AIRCAST_AUDIO=$AUDIO AIRCAST_PORT=$PORT AIRCAST_LOW_LATENCY=$LOW_LATENCY \
     setsid -f "$0" _session "$device_id" "$source" >>"$LOG" 2>&1 </dev/null
 
-  # Wait for the session to reach the receiver or fail, so callers get a real answer.
+  # Wait for the session to reach the receiver or fail, so callers get a real
+  # answer; a slow TV can take most of RECEIVER_TIMEOUT.
   local i phase
-  for ((i = 0; i < 300; i++)); do
+  for ((i = 0; i < 600; i++)); do
     sleep 0.1
     phase=$(jq -r '.phase // empty' "$STATE" 2>/dev/null)
     if [[ -s $LAST_ERROR ]]; then
@@ -255,6 +275,7 @@ RESTORE_WINDOW_FULLSCREEN=""
 RESTORE_SINK=""
 RESTORE_MODULE=""
 OUTPUT_CREATED=""
+TOKEN=""
 
 create_virtual_output() {
   local width=${RESOLUTION%x*} height=${RESOLUTION#*x} position i
@@ -314,12 +335,16 @@ raop_available() {
   [[ -e /usr/lib/pipewire-0.3/libpipewire-module-raop-sink.so ]]
 }
 
-# PipeWire names AirPlay sinks after the speaker, with its address in the name
-# or properties; match on either the address or the mDNS host name.
+# PipeWire names AirPlay sinks raop_sink.<host>.<address>.<port>. Split the
+# name and match the address or mDNS host name exactly: a substring would also
+# hit 192.168.1.50 for 192.168.1.5, or a speaker whose name contains this one's.
 find_raop_sink() {
-  pactl -f json list sinks 2>/dev/null | jq -r --arg a "$1" --arg h "${2%.local}" '
-    .[] | select(.name | startswith("raop")) |
-    select([.name, (.properties // {} | .[] | tostring)] | any(contains($a) or contains($h))) | .name' | head -1
+  pactl -f json list sinks 2>/dev/null | jq -r --arg a "$1" --arg h "$2" '
+    def host: ascii_downcase | rtrimstr(".") | rtrimstr(".local");
+    .[] | .name as $name | select($name | startswith("raop_sink.")) |
+    $name | ltrimstr("raop_sink.") | sub("\\.[0-9]+$"; "") |
+    capture("^(?<host>.+)\\.(?<ip>[0-9]+(\\.[0-9]+){3}|[0-9a-fA-F]*:[0-9a-fA-F:]*)$") |
+    select(.ip == $a or ($h != "" and (.host | host) == ($h | host))) | $name' | head -1
 }
 
 prepare_audio() {
@@ -485,7 +510,7 @@ HLS_FLAGS="delete_segments+omit_endlist+independent_segments"
 start_capture() {
   local kind=${CAPTURE[0]}
   local args=("${CAPTURE[@]:1}")
-  local server=(python3 -I "$LIB/live_server.py" "$PORT" "$RUNTIME/live.ready")
+  local server=(python3 -I "$LIB/live_server.py" "$PORT" "$RUNTIME/live.ready" "$TOKEN")
 
   if [[ $kind == sink ]]; then
     # PipeWire streams to the AirPlay speaker itself; just watch it stays around.
@@ -578,10 +603,14 @@ start_sender() {
   SENDER_PID=$!
 }
 
-# The sender prints "playing" once the receiver accepted the stream.
+# The sender prints "playing" once the receiver accepted the stream. A sender
+# gives up on its own (chromecast.py within 45 s); this is the backstop for
+# one a misbehaving receiver keeps waiting.
+RECEIVER_TIMEOUT=50
+
 wait_for_receiver() {
   local i
-  for ((i = 0; i < 300; i++)); do
+  for ((i = 0; i < RECEIVER_TIMEOUT * 10; i++)); do
     if [[ $SENDER_REPORTS_PLAYING == yes ]]; then
       grep -q '^playing$' "$LOG" && return 0
     elif ((i >= 30)); then
@@ -598,6 +627,7 @@ wait_for_receiver() {
     fi
     sleep 0.1
   done
+  die "$(jq -r .name <<<"$DEVICE") did not answer"
 }
 
 wait_for_stream() {
@@ -641,6 +671,7 @@ cmd_session() {
   SOURCE=$2
   SOURCE_LABEL=$SOURCE
   IN_SESSION=1
+  check_settings
   DEVICE=$(find_device "$device_id") || die "receiver $device_id not found"
   STARTED=$(date +%s)
 
@@ -660,15 +691,19 @@ cmd_session() {
     local host
     host=$(local_address "$(jq -r .address <<<"$DEVICE")" "$(jq -r .family <<<"$DEVICE")")
     [[ -n $host ]] || die "no network route to $(jq -r .name <<<"$DEVICE")"
-    URL="http://$host:$PORT/stream.m3u8"
-    [[ $STREAM == live ]] && URL="http://$host:$PORT/live.mp4"
+    # Only the receiver is told this path, so nothing else on the network,
+    # and no web page in the browser, can guess where to watch.
+    TOKEN=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    [[ ${#TOKEN} == 32 ]] || die "could not make a stream token"
+    URL="http://$host:$PORT/$TOKEN/stream.m3u8"
+    [[ $STREAM == live ]] && URL="http://$host:$PORT/$TOKEN/live.mp4"
     if ss -Hltn "sport = :$PORT" | grep -q .; then
       die "port $PORT is already in use (set AIRCAST_PORT)"
     fi
   fi
   # The live stream is served by the capture pipeline itself.
   if [[ $STREAM == hls ]]; then
-    python3 -I "$LIB/hls_server.py" "$HLS" "$PORT" &
+    python3 -I "$LIB/hls_server.py" "$HLS" "$PORT" "$TOKEN" &
     CHILDREN+=($!)
     SERVER_PID=$!
   fi
@@ -713,6 +748,7 @@ cmd_firewall() {
     echo "Removed $(wc -w <<<"$numbers") Aircast firewall rule(s)."
     return 0
   fi
+  check_settings
   # Private IPv4 ranges, IPv6 ULAs, and the global IPv6 prefixes of the
   # networks this machine is on right now (many TVs only announce IPv6).
   local network

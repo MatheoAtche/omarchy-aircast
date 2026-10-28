@@ -26,6 +26,12 @@ SENDER = "sender-aircast"
 RECEIVER = "receiver-0"
 DEFAULT_MEDIA_RECEIVER = "CC1AD845"
 
+MAX_MESSAGE = 65536  # the Cast protocol's own limit
+MESSAGE_TIMEOUT = 10  # for the rest of a message once it has started
+# Connecting, launching the player and loading the stream all fit in this;
+# bin/aircast waits a little longer before it gives up on the receiver.
+STARTUP_TIMEOUT = 45
+
 NS_CONNECTION = "urn:x-cast:com.google.cast.tp.connection"
 NS_HEARTBEAT = "urn:x-cast:com.google.cast.tp.heartbeat"
 NS_RECEIVER = "urn:x-cast:com.google.cast.receiver"
@@ -75,18 +81,20 @@ def decode(data):
         else:
             raise ValueError("unsupported wire type %d" % wire)
         fields[num] = value
-    text = lambda n: fields.get(n, b"").decode(errors="replace")
+    text = lambda n: fields[n].decode(errors="replace") if isinstance(fields.get(n), bytes) else ""
     payload = text(6)
     try:
         payload = json.loads(payload) if payload else {}
-    except ValueError:
+    except (ValueError, RecursionError):
         payload = {}
-    return text(2), text(3), text(4), payload
+    return text(2), text(3), text(4), payload if isinstance(payload, dict) else {}
 
 
 def _read_varint(data, i):
     shift = result = 0
     while True:
+        if i >= len(data):
+            raise ValueError("truncated varint")
         byte = data[i]
         i += 1
         result |= (byte & 0x7F) << shift
@@ -120,20 +128,45 @@ class Cast:
             self.connected.add(destination)
 
     def recv(self):
-        header = self._read_exact(4)
-        source, destination, namespace, payload = decode(self._read_exact(struct.unpack(">I", header)[0]))
+        """Read one message. socket.timeout means none started arriving in time.
+
+        Once a message has started, all of it has to arrive within
+        MESSAGE_TIMEOUT and fit in MAX_MESSAGE; a device that breaks either is
+        dropped, so it cannot hold the sender or grow its memory.
+        """
+        timeout = self.sock.gettimeout()
+        first = self.sock.recv(4)
+        if not first:
+            raise ConnectionError("device closed the connection")
+        deadline = time.monotonic() + MESSAGE_TIMEOUT
+        try:
+            size = struct.unpack(">I", first + self._read_exact(4 - len(first), deadline))[0]
+            if size > MAX_MESSAGE:
+                raise ConnectionError("device sent an oversized message (%d bytes)" % size)
+            source, destination, namespace, payload = decode(self._read_exact(size, deadline))
+        except ValueError as error:
+            raise ConnectionError("device sent a malformed message: %s" % error) from None
+        finally:
+            self.sock.settimeout(timeout)
         if namespace == NS_HEARTBEAT and payload.get("type") == "PING":
             self.send(source, NS_HEARTBEAT, {"type": "PONG"})
         return source, namespace, payload
 
-    def _read_exact(self, n):
-        buf = b""
+    def _read_exact(self, n, deadline):
+        buf = bytearray()
         while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError("device sent an incomplete message")
+            self.sock.settimeout(remaining)
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except socket.timeout:
+                raise ConnectionError("device sent an incomplete message") from None
             if not chunk:
                 raise ConnectionError("device closed the connection")
             buf += chunk
-        return buf
+        return bytes(buf)
 
     def wait_for(self, predicate, timeout=15):
         deadline = time.monotonic() + timeout
@@ -186,21 +219,22 @@ def cmd_stop(args):
 
 
 def cmd_play(args):
+    deadline = time.monotonic() + STARTUP_TIMEOUT
     cast = Cast(args.host)
 
     rid = cast.send(RECEIVER, NS_RECEIVER, {"type": "LAUNCH", "appId": DEFAULT_MEDIA_RECEIVER})
     app = None
-    deadline = time.monotonic() + 20
     while app is None:
-        if time.monotonic() > deadline:
-            raise TimeoutError("default media receiver did not start")
-        payload = cast.wait_for(lambda ns, p: ns == NS_RECEIVER and p.get("type") in ("RECEIVER_STATUS", "LAUNCH_ERROR"))
+        payload = cast.wait_for(lambda ns, p: ns == NS_RECEIVER and p.get("type") in ("RECEIVER_STATUS", "LAUNCH_ERROR"),
+                                timeout=deadline - time.monotonic())
         if payload.get("type") == "LAUNCH_ERROR":
             raise RuntimeError("launch failed: %s" % payload.get("reason"))
         app = find_app(payload.get("status") or {}, DEFAULT_MEDIA_RECEIVER)
 
-    session_id = app["sessionId"]
-    transport = app["transportId"]
+    session_id = app.get("sessionId")
+    transport = app.get("transportId")
+    if not session_id or not transport:
+        raise RuntimeError("launch failed: the device sent no session")
     cast.connect(transport)
 
     def stop(*_):
@@ -229,7 +263,7 @@ def cmd_play(args):
     })
     loaded = cast.wait_for(
         lambda ns, p: ns == NS_MEDIA and p.get("requestId") == rid and p.get("type") in ("MEDIA_STATUS", "LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST"),
-        timeout=30,
+        timeout=deadline - time.monotonic(),
     )
     if loaded.get("type") != "MEDIA_STATUS":
         raise RuntimeError("device refused the stream: %s" % loaded.get("type"))
@@ -247,8 +281,8 @@ def cmd_play(args):
             _, namespace, payload = cast.recv()
         except socket.timeout:
             continue
-        except (ConnectionError, OSError):
-            print("device disconnected", flush=True)
+        except OSError as error:
+            print("device disconnected: %s" % error, flush=True)
             return
         if namespace == NS_RECEIVER and payload.get("type") == "RECEIVER_STATUS":
             current = find_app(payload.get("status") or {})
@@ -281,6 +315,10 @@ def main():
         {"status": cmd_status, "stop": cmd_stop, "play": cmd_play}[args.command](args)
     except (OSError, TimeoutError, RuntimeError, ConnectionError) as error:
         print("chromecast: %s" % error, file=sys.stderr)
+        sys.exit(1)
+    except (KeyError, TypeError, AttributeError) as error:
+        # Replies come from whatever answered on the network; don't trust their shape.
+        print("chromecast: unexpected reply from the device (%r)" % error, file=sys.stderr)
         sys.exit(1)
 
 

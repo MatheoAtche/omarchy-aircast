@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Relay a fragmented MP4 from stdin to cast receivers as one endless HTTP response.
 
-  <encoder> | live_server.py <port> <ready-file>
+  <encoder> | live_server.py <port> <ready-file> <token>
 
 This is the low-latency path: the receiver plays fragments as they arrive
 (~0.1 s each, frag_duration) instead of waiting for several finished HLS
 segments. A new client gets the init segment (ftyp+moov) and then joins at the
 next fragment that opens on a keyframe, so it starts as close to live as
 possible instead of replaying the current GOP. <ready-file> is created once the
-first keyframe fragment is available.
+first keyframe fragment is available. The stream is only served at
+/<token>/live.mp4, a random path made for each cast, so devices and web pages
+that weren't given the URL can't watch.
 """
 
 import http.server
@@ -26,6 +28,9 @@ lock = threading.Lock()
 finished = threading.Event()
 
 NON_SYNC = 0x00010000  # sample_is_non_sync_sample in ISO BMFF sample flags
+MAX_CONNECTIONS = 16  # a receiver needs one or two; this bounds threads and memory
+
+slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 
 def children(box, header=8):
@@ -134,6 +139,16 @@ def deliver(mailbox, data):
         return False
 
 
+def release(mailbox):
+    """Free a client's backlog and wake its handler, which closes the connection."""
+    while True:
+        try:
+            mailbox.get_nowait()
+        except queue.Empty:
+            break
+    mailbox.put_nowait(None)
+
+
 def pump(ready_file):
     global init_segment
     fragment = b""
@@ -158,7 +173,9 @@ def pump(ready_file):
                     joining.clear()
                 for client in list(clients):
                     if not deliver(client, fragment):
-                        clients.discard(client)  # too slow; it reconnects
+                        # Too slow: close it so it reconnects and joins live.
+                        clients.discard(client)
+                        release(client)
             if keyframe and not ready:
                 open(ready_file, "w").close()
                 ready = True
@@ -166,11 +183,12 @@ def pump(ready_file):
     finished.set()
     with lock:
         for client in clients | joining:
-            client.put(None)
+            release(client)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 10  # a client that stops reading this long is disconnected
 
     def headers_out(self):
         self.send_header("Content-Type", "video/mp4")
@@ -186,14 +204,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_HEAD(self):
-        if self.path.split("?")[0] != "/live.mp4":
+        if self.path.split("?")[0] != self.server.live_path:
             return self.send_error(404)
         self.send_response(200)
         self.headers_out()
         self.end_headers()
 
     def do_GET(self):
-        if self.path.split("?")[0] != "/live.mp4" or finished.is_set():
+        if self.path.split("?")[0] != self.server.live_path or finished.is_set():
             return self.send_error(404)
         # Range requests are answered with the live stream from now on; there
         # is nothing to seek to.
@@ -233,10 +251,29 @@ class DualStackServer(http.server.ThreadingHTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = "aircast", self.server_address[1]
 
+    def process_request(self, request, client_address):
+        # Refuse connections beyond what a receiver needs instead of starting
+        # a thread for each.
+        if not slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            slots.release()
+
 
 def main():
-    port, ready_file = int(sys.argv[1]), sys.argv[2]
+    port, ready_file, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     server = DualStackServer(("::", port), Handler)
+    server.live_path = "/%s/live.mp4" % token
     threading.Thread(target=server.serve_forever, daemon=True).start()
     pump(ready_file)  # returns when the encoder stops
 
